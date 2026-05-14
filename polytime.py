@@ -230,18 +230,23 @@ def polytime(
     # merge every track's notes into a single flat theme, preserving the
     # full polyphony of the input.
     score = load_mido(str(input_path), time_signature=time_signature)
-    theme = _flatten_score(score)
-    # Optional theme cropping: keep only events whose onset is in [start, end)
-    # and re-base offsets to 0 so the slice becomes the new "beat 0".
+    full_theme = _flatten_score(score)
+    # theme_range controls *what gets echoed*, not what goes into the output.
+    # When combine=True the full original is preserved as the theme track no
+    # matter how narrow the echoed slice is.
     if theme_range is not None:
         ts_start, ts_end = theme_range
-        theme = Voice(id="theme", events=tuple(
+        echo_source = Voice(id="theme", events=tuple(
             replace(e, offset=e.offset - ts_start)
-            for e in theme.events
+            for e in full_theme.events
             if ts_start <= e.offset < ts_end
         ))
-        if not theme.events:
+        if not echo_source.events:
             raise ValueError(f"theme range {ts_start}..{ts_end} contains no notes")
+    else:
+        echo_source = full_theme
+    # `theme` is the local name used downstream for echo construction.
+    theme = echo_source
 
     def _fmt(x: Fraction) -> str:
         # Compact label: keep small fractions exact (3/2, 5/4) but render
@@ -269,14 +274,19 @@ def polytime(
         )
         return Voice(id=v.id, events=kept)
 
-    theme = _crop(theme)
+    # The exported "theme" track is the FULL original — independent of
+    # theme_range, which only governs what gets echoed.
+    theme_for_output = Voice(id="theme", events=full_theme.events)
+    theme_for_output = _crop(theme_for_output)
     echo_voices = [_crop(v) for v in echo_voices]
-    # Drop voices that ended up empty after cropping.
     echo_voices = [v for v in echo_voices if v.events]
 
     # Each MIDI-bound voice becomes its own Part → its own MIDI track,
     # so DAWs can solo/mute them independently.
-    exported: list[Voice] = ([theme] if combine and theme.events else []) + echo_voices
+    exported: list[Voice] = (
+        ([theme_for_output] if combine and theme_for_output.events else [])
+        + echo_voices
+    )
     if not exported:
         raise ValueError("output range eliminated every voice — widen the crop")
     parts = tuple(
@@ -295,8 +305,8 @@ def polytime(
     viz_path = Path(diff_png) if diff_png else out.with_suffix(".svg")
     title = f"{input_path.stem} echoes scales=[{scales_label}] ats=[{ats_label}]"
     rows: list[tuple[str, Voice]] = []
-    if combine:
-        rows.append(("theme", theme))
+    if combine and theme_for_output.events:
+        rows.append(("theme", theme_for_output))
     for v in echo_voices:
         rows.append((v.id, v))
     ext = viz_path.suffix.lower()

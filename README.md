@@ -40,6 +40,7 @@ Grab the right zip from the [Releases](../../releases) page:
 ## The UI
 
 - **Drop zone** — drag a `.mid` in, or click to choose, or use the MIDI keyboard recorder below.
+- **Piano rolls** — both the *before* (loaded MIDI) and *after* (theme + echoes) panes are interactive canvas piano rolls. Click sets a selection start; clicking again sets the end. Drag for free-precision range select. Shift-click extends the end. Shift-drag pans. Mouse wheel zooms toward the cursor. Clicks snap to nearby note onsets (±½ beat). Selections on the *before* roll fill the `echo source` field; selections on the *after* roll fill the `output range` field.
 - **MIDI keyboard input** — appears automatically if your browser supports the Web MIDI API. Plug a keyboard in, press Record, play, press Stop. Capture is free-time at millisecond precision; the BPM field controls how those milliseconds map to beats. The first key you press becomes beat 0.
 - **at** — when each echo enters. One value (e.g. `2b`) staggers them: voice *k* enters at *k×at*. A comma list (`2b, 5b, 9b`) gives each voice its own entry time. Suffixes: `b` = bars, `s` = seconds, no suffix = beats.
 - **scales** — comma-separated, one per echo voice. Examples below.

@@ -13,7 +13,6 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 import webbrowser
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,8 +27,6 @@ from polytime import (  # noqa: E402
 )
 from model.measure import TimeSignature  # noqa: E402
 
-
-VIZ_CACHE: dict[str, bytes] = {}
 
 # Auto-shutdown: the browser pings /heartbeat every few seconds. If we go
 # HEARTBEAT_TIMEOUT_S without a ping, the server exits — so closing the tab
@@ -66,6 +63,14 @@ INDEX_HTML = """<!doctype html>
  .vizpane h3{margin:0 0 4px;font-size:13px;color:#aaa;font-weight:500}
  iframe{width:100%;height:46vh;border:1px solid #333;border-radius:4px;background:#fff}
  iframe.empty{background:#222;border-style:dashed}
+ canvas.pr{width:100%;height:280px;border:1px solid #333;border-radius:4px;
+     background:#181818;display:block;cursor:crosshair}
+ canvas.pr.empty{border-style:dashed}
+ canvas#prAfter{height:auto}
+ .prCtrl{display:flex;gap:6px;align-items:center;font-size:12px;color:#888;margin-top:-4px}
+ .prCtrl button{padding:2px 8px;background:#333;color:#ccc;border:1px solid #555;
+                border-radius:3px;cursor:pointer;font:inherit}
+ .prCtrl button:hover{background:#444}
 </style></head>
 <body>
 <h1>polytime — rhythm-scaled MIDI echoes</h1>
@@ -105,8 +110,8 @@ INDEX_HTML = """<!doctype html>
   </label>
 </div>
 <div class="row">
-  <label>theme range (use only part of input — beats or bars)
-    <input id="themeRange" type="text" placeholder="all   or   0..4b   or   8..16" style="width:220px">
+  <label>echo source (which slice of the input gets echoed — original stays whole)
+    <input id="themeRange" type="text" placeholder="all   or   0..4b   or   8..16" style="width:260px">
   </label>
   <label>output range (crop the final MIDI)
     <input id="outRange" type="text" placeholder="all   or   0..16b" style="width:220px">
@@ -118,36 +123,378 @@ INDEX_HTML = """<!doctype html>
 </div>
 <div id="status"></div>
 <div class="vizpane">
-  <div><h3>before (loaded MIDI)</h3><iframe id="vizBefore" class="empty" sandbox="allow-scripts"></iframe></div>
-  <div><h3>after (echoes)</h3><iframe id="vizAfter" class="empty" sandbox="allow-scripts"></iframe></div>
+  <div>
+    <h3>before (loaded MIDI) — click sets start, click again = end · drag = select · shift-drag = pan · wheel = zoom · clicks snap to nearby notes</h3>
+    <canvas id="prBefore" class="pr empty"></canvas>
+    <div class="prCtrl">
+      <button data-roll="before" data-action="zout">−</button>
+      <button data-roll="before" data-action="zin">+</button>
+      <button data-roll="before" data-action="fit">fit</button>
+      <button data-roll="before" data-action="clear">clear selection</button>
+      <span>selects echo source</span>
+    </div>
+  </div>
+  <div>
+    <h3>after (theme + echoes) — same interactions; selection here = output crop</h3>
+    <canvas id="prAfter" class="pr empty"></canvas>
+    <div class="prCtrl">
+      <button data-roll="after" data-action="zout">−</button>
+      <button data-roll="after" data-action="zin">+</button>
+      <button data-roll="after" data-action="fit">fit</button>
+      <button data-roll="after" data-action="clear">clear selection</button>
+      <span>selects output crop</span>
+    </div>
+  </div>
 </div>
 <script>
 const $=(id)=>document.getElementById(id);
 const drop=$('drop'), file=$('file'), picked=$('picked'),
       go=$('go'), dl=$('dl'), st=$('status'),
-      vizB=$('vizBefore'), vizA=$('vizAfter');
+      prBeforeEl=$('prBefore'), prAfterEl=$('prAfter');
 let chosen=null, dlUrl=null, dlName=null, jobId=0;
 
 function setStatus(msg, err=false){st.textContent=msg;st.className=err?'err':'';}
 
+// ── Interactive piano roll ─────────────────────────────────────────────
+// One factory used twice: a single-voice version for the "before" pane
+// (selection -> echo source) and a multi-voice stacked version for the
+// "after" pane (selection -> output crop). Coordinates are stored in BEATS
+// and MIDI pitch, never pixels — selections survive any zoom/pan.
+//
+// Interactions:
+//   - click            : sets start of selection; snaps to nearby note onset
+//   - second click     : sets end                ; snaps similarly
+//   - shift+click      : extends end (without clearing the anchor)
+//   - drag             : free-precision range select (no snap)
+//   - shift+drag       : pan
+//   - wheel            : zoom toward cursor
+//   - +/- / fit / clear: toolbar buttons
+
+const SNAP_TOLERANCE_BEATS = 0.5;
+const DRAG_THRESHOLD_PX = 4;
+const PALETTE = ['#3a7bd5','#d55e3a','#3ad57b','#d5c43a','#9933cc',
+                 '#33aaff','#ff6699','#66cc88','#aaaa44'];
+
+function createPianoRoll(canvas, inputId) {
+  const c = canvas, ctx = c.getContext('2d');
+  // single-row mode: rows=[{label:'theme', notes:[…]}]
+  // multi-row mode:  rows=[{label:'theme'}, {label:'echo_1…'}, …, {label:'combined', overlay:true}]
+  let rows = [];
+  let totalBeats = 16, pitchLo = 60, pitchHi = 72, beatsPerBar = 4;
+  let xMin = 0, xMax = 16;
+  let sel = null;             // [startBeat, endBeat] or null
+  let anchor = null;          // pending click anchor beat (first click of a click+click sequence)
+  let drag = null;            // {mode, startX, startBeat, moved}
+
+  const padL = 60, padR = 12, padT = 8, padB = 22;
+  const ROW_MIN_H = 70;       // px per row (before-mode = full canvas)
+
+  function fitCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    const r = c.getBoundingClientRect();
+    // Multi-row mode auto-resizes the canvas to fit all rows.
+    if (rows.length > 1) {
+      const wantedH = padT + padB + rows.length * ROW_MIN_H;
+      if (c.clientHeight !== wantedH) c.style.height = wantedH + 'px';
+    }
+    const r2 = c.getBoundingClientRect();
+    c.width = Math.round(r2.width * dpr);
+    c.height = Math.round(r2.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return r2;
+  }
+  const plotW = (r) => r.width - padL - padR;
+  const plotH = (r) => r.height - padT - padB;
+  const beatToX = (b, r) => padL + (b - xMin) / (xMax - xMin) * plotW(r);
+  const xToBeat = (x, r) => xMin + (x - padL) / plotW(r) * (xMax - xMin);
+
+  function rowBounds(r) {
+    const h = plotH(r) / Math.max(1, rows.length);
+    return rows.map((_, i) => ({ y0: padT + i * h, y1: padT + (i+1) * h }));
+  }
+  function pitchToY(p, rowIdx, r) {
+    const rb = rowBounds(r)[rowIdx];
+    const lo = pitchLo - 1, hi = pitchHi + 1;
+    return rb.y0 + 4 + (hi - p) / (hi - lo) * (rb.y1 - rb.y0 - 8);
+  }
+
+  function snapToNote(beat) {
+    let best = beat, bestD = SNAP_TOLERANCE_BEATS;
+    for (const row of rows) {
+      if (!row.notes) continue;
+      for (const n of row.notes) {
+        const d = Math.abs(n.on - beat);
+        if (d < bestD) { bestD = d; best = n.on; }
+        const d2 = Math.abs(n.off - beat);
+        if (d2 < bestD) { bestD = d2; best = n.off; }
+      }
+    }
+    return best;
+  }
+
+  function draw() {
+    const r = fitCanvas();
+    ctx.fillStyle = '#181818';
+    ctx.fillRect(0, 0, r.width, r.height);
+    // bar grid (full plot height)
+    ctx.strokeStyle = '#2a2a2a'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#666'; ctx.font = '11px system-ui,sans-serif';
+    ctx.textBaseline = 'top';
+    const firstBar = Math.floor(xMin / beatsPerBar);
+    const lastBar = Math.ceil(xMax / beatsPerBar);
+    for (let b = firstBar; b <= lastBar; b++) {
+      const beat = b * beatsPerBar;
+      const x = beatToX(beat, r);
+      if (x < padL - 1 || x > r.width - padR + 1) continue;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, r.height - padB); ctx.stroke();
+      ctx.fillText('bar ' + (b+1), x + 3, r.height - padB + 3);
+    }
+    // selection
+    if (sel) {
+      const x0 = Math.max(padL, beatToX(sel[0], r));
+      const x1 = Math.min(r.width - padR, beatToX(sel[1], r));
+      ctx.fillStyle = 'rgba(120,170,255,0.18)';
+      ctx.fillRect(x0, padT, x1 - x0, plotH(r));
+      ctx.strokeStyle = '#7aa3ff'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x0, padT); ctx.lineTo(x0, r.height - padB);
+      ctx.moveTo(x1, padT); ctx.lineTo(x1, r.height - padB);
+      ctx.stroke();
+    }
+    // anchor (pending first-click)
+    if (anchor != null) {
+      const x = beatToX(anchor, r);
+      ctx.strokeStyle = '#f7c948'; ctx.setLineDash([4,3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, r.height - padB); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#f7c948';
+      ctx.fillText('start', x + 3, padT + 2);
+    }
+    // rows
+    const rb = rowBounds(r);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      // row separator
+      if (i > 0) {
+        ctx.strokeStyle = '#2a2a2a'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, rb[i].y0); ctx.lineTo(r.width-padR, rb[i].y0); ctx.stroke();
+      }
+      // row label on the left
+      ctx.fillStyle = '#bbb'; ctx.font = '11px system-ui,sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.fillText(row.label || '', 4, rb[i].y0 + 4);
+      // notes
+      const rowH = rb[i].y1 - rb[i].y0 - 8;
+      const noteH = Math.max(2, rowH / (pitchHi - pitchLo + 3));
+      if (row.overlay) {
+        // combined row: overlay every other row in palette colors
+        for (let j = 0; j < rows.length; j++) {
+          if (rows[j].overlay) continue;
+          ctx.fillStyle = PALETTE[j % PALETTE.length];
+          ctx.globalAlpha = 0.7;
+          drawNotes(rows[j].notes, i, r, noteH);
+        }
+        ctx.globalAlpha = 1.0;
+      } else {
+        ctx.fillStyle = PALETTE[i % PALETTE.length];
+        drawNotes(row.notes, i, r, noteH);
+      }
+    }
+    // plot border
+    ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
+    ctx.strokeRect(padL, padT, plotW(r), plotH(r));
+  }
+  function drawNotes(notes, rowIdx, r, noteH) {
+    if (!notes) return;
+    for (const n of notes) {
+      if (n.off < xMin || n.on > xMax) continue;
+      const x = beatToX(n.on, r);
+      const w = Math.max(1, beatToX(n.off, r) - x);
+      const y = pitchToY(n.midi, rowIdx, r) - noteH/2;
+      ctx.fillRect(x, y, w, noteH);
+    }
+  }
+
+  const clipBeats = (b) => Math.max(0, Math.min(totalBeats, b));
+
+  function fitView() {
+    xMin = 0;
+    xMax = Math.max(4, totalBeats * 1.02);
+    draw();
+  }
+  function zoomAt(factor, anchorBeat) {
+    const span = (xMax - xMin) / factor;
+    if (span < 0.5) return;
+    const t = (anchorBeat - xMin) / (xMax - xMin);
+    xMin = anchorBeat - t * span;
+    xMax = anchorBeat + (1 - t) * span;
+    if (xMin < -span * 0.1) { xMax -= xMin; xMin = 0; }
+    draw();
+  }
+
+  function setSelection(s, e) {
+    if (s == null || e == null || e <= s) sel = null;
+    else sel = [clipBeats(s), clipBeats(e)];
+    syncToInput();
+    draw();
+  }
+  function syncToInput() {
+    if (!inputId) return;
+    const inp = $(inputId);
+    if (!inp) return;
+    if (sel) inp.value = sel[0].toFixed(2) + '..' + sel[1].toFixed(2);
+    else inp.value = '';
+  }
+  function syncFromInput() {
+    if (!inputId) return;
+    const v = $(inputId).value.trim();
+    if (!v.includes('..')) { sel = null; draw(); return; }
+    const [a, b] = v.split('..').map(s => s.trim());
+    const parse = (s) => {
+      if (!s) return 0;
+      if (s.endsWith('b')) return parseFloat(s.slice(0,-1)) * beatsPerBar;
+      return parseFloat(s);
+    };
+    const s = parse(a), e = parse(b);
+    if (!isFinite(s) || !isFinite(e) || e <= s) { sel = null; draw(); return; }
+    sel = [clipBeats(s), clipBeats(e)];
+    draw();
+  }
+
+  // ── input handlers ───────────────────────────────────────────────────
+  c.addEventListener('mousedown', (e) => {
+    const r = c.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    const beat = clipBeats(xToBeat(mx, r));
+    if (e.shiftKey && e.button === 0 && !drag) {
+      // could be shift+click (extend) or shift+drag (pan) — defer decision
+      drag = { mode: 'shift-pending', startX: mx, startBeat: beat,
+               anchorBeat: anchor, lastX: mx, moved: false };
+    } else if (e.button === 2) {
+      drag = { mode: 'pan', startX: mx, lastX: mx, moved: false };
+    } else {
+      drag = { mode: 'pending', startX: mx, startBeat: beat, moved: false };
+    }
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    const r = c.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    if (!drag.moved && Math.abs(mx - drag.startX) > DRAG_THRESHOLD_PX) {
+      drag.moved = true;
+      if (drag.mode === 'shift-pending') drag.mode = 'pan';
+      else if (drag.mode === 'pending')  drag.mode = 'drag-select';
+    }
+    if (drag.mode === 'drag-select') {
+      const cur = clipBeats(xToBeat(mx, r));
+      anchor = null;  // dragging overrides any pending anchor
+      const lo = Math.min(drag.startBeat, cur), hi = Math.max(drag.startBeat, cur);
+      setSelection(lo, hi);
+    } else if (drag.mode === 'pan') {
+      const dx = mx - drag.lastX;
+      const dBeat = -dx / plotW(r) * (xMax - xMin);
+      xMin += dBeat; xMax += dBeat;
+      drag.lastX = mx;
+      draw();
+    }
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (!drag) return;
+    if (!drag.moved) {
+      // it was a click, not a drag
+      const r = c.getBoundingClientRect();
+      const mx = e.clientX - r.left;
+      const beat = snapToNote(clipBeats(xToBeat(mx, r)));
+      if (drag.mode === 'shift-pending' || e.shiftKey) {
+        // shift+click: extend end of selection
+        const start = (sel ? sel[0] : (anchor != null ? anchor : beat));
+        const lo = Math.min(start, beat), hi = Math.max(start, beat);
+        if (hi > lo) setSelection(lo, hi);
+        anchor = null;
+      } else if (anchor == null) {
+        anchor = beat;
+        draw();
+      } else {
+        const lo = Math.min(anchor, beat), hi = Math.max(anchor, beat);
+        anchor = null;
+        if (hi > lo) setSelection(lo, hi);
+      }
+    }
+    drag = null;
+  });
+  c.addEventListener('contextmenu', (e) => e.preventDefault());
+  c.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const r = c.getBoundingClientRect();
+    const mx = e.clientX - r.left;
+    zoomAt(Math.exp(-e.deltaY * 0.0015), xToBeat(mx, r));
+  }, {passive: false});
+
+  if (inputId) {
+    $(inputId).addEventListener('input', syncFromInput);
+  }
+
+  return {
+    load(rs, meta) {
+      rows = rs;
+      totalBeats = meta.total_beats || 16;
+      pitchLo = meta.pitch_lo ?? 60;
+      pitchHi = meta.pitch_hi ?? 72;
+      beatsPerBar = meta.beats_per_bar || 4;
+      sel = null; anchor = null;
+      fitView();
+      syncFromInput();
+    },
+    clear() {
+      rows = []; sel = null; anchor = null;
+      const r = c.getBoundingClientRect();
+      c.width = r.width; c.height = r.height;
+      ctx.fillStyle = '#181818'; ctx.fillRect(0,0,c.width,c.height);
+    },
+    fit() { fitView(); },
+    zoom(factor) { zoomAt(factor, (xMin + xMax) / 2); },
+    clearSel() { anchor = null; setSelection(null, null); },
+    redraw() { draw(); },
+  };
+}
+
+const prBefore = createPianoRoll($('prBefore'), 'themeRange');
+const prAfter  = createPianoRoll($('prAfter'),  'outRange');
+
+document.querySelectorAll('.prCtrl button[data-roll]').forEach(btn => {
+  const target = btn.dataset.roll === 'before' ? prBefore : prAfter;
+  btn.addEventListener('click', () => {
+    switch (btn.dataset.action) {
+      case 'zin':   target.zoom(1.4); break;
+      case 'zout':  target.zoom(1/1.4); break;
+      case 'fit':   target.fit(); break;
+      case 'clear': target.clearSel(); break;
+    }
+  });
+});
+
+window.addEventListener('resize', () => { prBefore.redraw(); prAfter.redraw(); });
+
+
+
+
 async function pickFile(f){
-  // Bump the job id so any in-flight request from a previous file is ignored
-  // when it returns.
   const mine = ++jobId;
   chosen=f; picked.textContent=f.name;
-  vizB.src='about:blank'; vizB.classList.add('empty');
-  vizA.src='about:blank'; vizA.classList.add('empty');
+  prBefore.clear(); $('prBefore').classList.add('empty');
+  prAfter.clear();  $('prAfter').classList.add('empty');
   dl.style.display='none'; dlUrl=null; dlName=null;
   setStatus('loading preview...');
   const fd=new FormData(); fd.append('mid', f);
   try{
     const r=await fetch('/preview',{method:'POST',body:fd});
     const j=await r.json();
-    if(mine !== jobId) return;   // a newer file was picked — discard
+    if(mine !== jobId) return;
     if(!r.ok) throw new Error(j.error||'preview failed');
-    vizB.src='/viz/'+j.viz_token; vizB.classList.remove('empty');
+    prBefore.load([{label: 'theme', notes: j.notes}], j);
+    $('prBefore').classList.remove('empty');
     $('tsig').placeholder='auto — detected '+j.detected_ts;
-    setStatus('detected time signature: '+j.detected_ts);
+    setStatus('detected time signature: '+j.detected_ts+' · '+j.notes.length+' notes');
   }catch(e){
     if(mine !== jobId) return;
     setStatus('error: '+e.message, true);
@@ -189,9 +536,10 @@ go.addEventListener('click',async()=>{
     if(mine !== jobId) return;
     if(!r.ok) throw new Error(j.error||'failed');
     setStatus('time signature: '+j.detected_ts);
-    const perRow = 200;
-    vizA.style.height = Math.max(320, perRow * (j.n_rows || 1) + 80) + 'px';
-    vizA.src='/viz/'+j.viz_token; vizA.classList.remove('empty');
+    const rows = j.voices.map(v => ({label: v.label, notes: v.notes}));
+    if (rows.length > 1) rows.push({label: 'combined', overlay: true});
+    prAfter.load(rows, j);
+    $('prAfter').classList.remove('empty');
     dlUrl=j.midi_data_url; dlName=j.midi_filename;
     dl.style.display='inline-block';
   }catch(e){
@@ -397,13 +745,53 @@ def parse_multipart(body: bytes, boundary: bytes) -> dict[str, bytes | tuple[str
     return out
 
 
-def cache_viz(data: bytes) -> str:
-    token = uuid.uuid4().hex
-    VIZ_CACHE[token] = data
-    if len(VIZ_CACHE) > 20:
-        for k in list(VIZ_CACHE)[:-20]:
-            VIZ_CACHE.pop(k, None)
-    return token
+def _voices_from_midi(path: Path) -> tuple[list[dict], float, int, int]:
+    """Read the output MIDI back into a per-track note list for the client
+    piano roll. Tracks with no notes (e.g. tempo-only) are dropped."""
+    import mido
+    mf = mido.MidiFile(str(path))
+    ppq = mf.ticks_per_beat
+    voices = []
+    all_pitches: list[int] = []
+    max_end = 0.0
+    for track in mf.tracks:
+        name = None
+        for msg in track:
+            if msg.type == "track_name":
+                # save_mido writes "<part>/<voice>". In polytime that's
+                # "X/X" because part_name == voice_id; un-double it. Voice IDs
+                # themselves can contain '/', so we can't just split-and-keep-last.
+                raw = msg.name
+                if "/" in raw:
+                    half = len(raw) // 2
+                    if raw[:half] == raw[half+1:] and raw[half] == "/":
+                        raw = raw[:half]
+                name = raw
+                break
+        if name is None:
+            name = "voice"
+        absolute = 0
+        open_notes: dict[int, int] = {}
+        notes: list[dict] = []
+        for msg in track:
+            absolute += msg.time
+            if msg.type == "note_on" and msg.velocity > 0:
+                open_notes[msg.note] = absolute
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                start = open_notes.pop(msg.note, None)
+                if start is None:
+                    continue
+                on = start / ppq
+                off = absolute / ppq
+                notes.append({"midi": msg.note, "on": on, "off": off})
+                all_pitches.append(msg.note)
+                if off > max_end:
+                    max_end = off
+        if notes:
+            voices.append({"label": name, "notes": notes})
+    if not all_pitches:
+        all_pitches = [60, 72]
+    return voices, max(max_end, 4.0), min(all_pitches), max(all_pitches)
 
 
 def parse_ts(s: str | None) -> TimeSignature | None:
@@ -444,13 +832,6 @@ class Handler(BaseHTTPRequestHandler):
             LAST_HEARTBEAT = time.monotonic()
             self._send(200, b"ok", "text/plain")
             return
-        if self.path.startswith("/viz/"):
-            data = VIZ_CACHE.get(self.path[len("/viz/"):])
-            if data is None:
-                self._send(404, b"not found", "text/plain")
-                return
-            self._send(200, data, "text/html; charset=utf-8")
-            return
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
@@ -486,24 +867,33 @@ class Handler(BaseHTTPRequestHandler):
             detected = detect_time_signature(in_path)
             ts = detected or TimeSignature(4, 4)
             from score_io.live.midi_file import load_mido
-            from viz.interactive import multi_row_html
             from polytime import _flatten_score
+            from model.events import Note, Chord
             score = load_mido(str(in_path), time_signature=ts)
             theme = _flatten_score(score)
-            viz_tmp = Path(tempfile.mkstemp(suffix=".html")[1])
-            try:
-                multi_row_html([("theme", theme)], viz_tmp,
-                               title="loaded MIDI", combined=False)
-                viz_data = viz_tmp.read_bytes()
-            finally:
-                try: viz_tmp.unlink()
-                except OSError: pass
+            # Flatten chords to individual notes so the client gets a uniform
+            # {midi, on, off} list.
+            notes_out = []
+            for e in theme.events:
+                on = float(e.offset)
+                off = on + float(e.duration.actual_beats)
+                if isinstance(e, Chord):
+                    for p in e.pitches:
+                        notes_out.append({"midi": p.midi, "on": on, "off": off})
+                elif isinstance(e, Note):
+                    notes_out.append({"midi": e.pitch.midi, "on": on, "off": off})
+            total_beats = max((n["off"] for n in notes_out), default=4.0)
+            pitches = [n["midi"] for n in notes_out] or [60, 72]
         finally:
             try: in_path.unlink()
             except OSError: pass
 
         payload = {
-            "viz_token": cache_viz(viz_data),
+            "notes": notes_out,
+            "total_beats": total_beats,
+            "pitch_lo": min(pitches),
+            "pitch_hi": max(pitches),
+            "beats_per_bar": float(ts.beats_per_measure),
             "detected_ts": f"{ts.numerator}/{ts.denominator}" +
                            ("" if detected else " (default)"),
         }
@@ -538,7 +928,6 @@ class Handler(BaseHTTPRequestHandler):
             f.write(mid_bytes)
             in_path = Path(f.name)
         out_mid = Path(tempfile.mkstemp(suffix=".mid")[1])
-        out_viz = Path(tempfile.mkstemp(suffix=".html")[1])
 
         try:
             detected_bpm = detect_bpm(in_path)
@@ -586,26 +975,33 @@ class Handler(BaseHTTPRequestHandler):
                 ats = tuple(resolved)
             theme_range = parse_range(theme_range_str, ts.beats_per_measure)
             output_range = parse_range(output_range_str, ts.beats_per_measure)
-            mid_path, viz_path = polytime(
+            mid_path, _viz_path = polytime(
                 in_path, at=at_f, scales=scales, ats=ats,
-                out=out_mid, diff_png=out_viz, time_signature=ts,
+                out=out_mid, diff_png=None, time_signature=ts,
                 combine=combine, viz_connectors=False,
                 theme_range=theme_range, output_range=output_range,
             )
             mid_data = mid_path.read_bytes()
-            viz_data = viz_path.read_bytes()
+            # Read the produced MIDI back to recover the per-track note streams
+            # — much simpler than threading them back through polytime().
+            voices_payload, total_beats, pitch_lo, pitch_hi = _voices_from_midi(
+                mid_path
+            )
         finally:
-            for p in (in_path, out_mid, out_viz):
+            for p in (in_path, out_mid):
                 try: p.unlink()
                 except OSError: pass
 
         payload = {
-            "viz_token": cache_viz(viz_data),
+            "voices": voices_payload,
+            "total_beats": total_beats,
+            "pitch_lo": pitch_lo,
+            "pitch_hi": pitch_hi,
+            "beats_per_bar": float(ts.beats_per_measure),
             "midi_data_url": "data:audio/midi;base64," +
                              base64.b64encode(mid_data).decode("ascii"),
             "midi_filename": f"{stem}_polytime.mid",
             "detected_ts": ts_label,
-            "n_rows": n_rows,
         }
         self._send(200, json.dumps(payload).encode("utf-8"),
                    "application/json; charset=utf-8")
