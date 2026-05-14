@@ -6,10 +6,12 @@ Build: build.bat  (PyInstaller --onefile --noconsole)
 from __future__ import annotations
 import base64
 import json
+import os
 import socket
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 import webbrowser
@@ -27,6 +29,13 @@ from model.measure import TimeSignature  # noqa: E402
 
 
 VIZ_CACHE: dict[str, bytes] = {}
+
+# Auto-shutdown: the browser pings /heartbeat every few seconds. If we go
+# HEARTBEAT_TIMEOUT_S without a ping, the server exits — so closing the tab
+# (or the whole browser) doesn't leave a zombie process holding the port.
+LAST_HEARTBEAT = time.monotonic()
+HEARTBEAT_TIMEOUT_S = 20.0
+HEARTBEAT_CHECK_S = 5.0
 
 
 INDEX_HTML = """<!doctype html>
@@ -92,6 +101,8 @@ INDEX_HTML = """<!doctype html>
   </label>
   <button id="go">Generate</button>
   <button id="dl" class="dl" style="display:none">Download MIDI</button>
+  <button id="quit" style="background:#444;color:#ccc;margin-left:auto"
+          title="Stop the server and close polytime">× Quit</button>
 </div>
 <div id="status"></div>
 <div class="vizpane">
@@ -169,6 +180,20 @@ go.addEventListener('click',async()=>{
 dl.addEventListener('click',()=>{
   if(!dlUrl)return;
   const a=document.createElement('a');a.href=dlUrl;a.download=dlName;a.click();
+});
+
+// Keep-alive: ping every 5s so the server knows we're still here. If the
+// user closes the tab, the pings stop, and the server self-terminates after
+// ~20s. Also send an explicit shutdown beacon on unload as a fast path.
+setInterval(() => fetch('/heartbeat').catch(()=>{}), 5000);
+window.addEventListener('beforeunload', () => {
+  try { navigator.sendBeacon('/shutdown'); } catch (e) {}
+});
+$('quit').addEventListener('click', () => {
+  if (!confirm('Stop polytime?')) return;
+  fetch('/shutdown', {method:'POST'}).catch(()=>{});
+  document.body.innerHTML='<div style=\"padding:40px;font-family:sans-serif;'
+    +'color:#aaa;text-align:center\">polytime stopped. You can close this tab.</div>';
 });
 
 // ── MIDI keyboard input (Web MIDI API) ──────────────────────────────────
@@ -381,6 +406,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if self.path == "/heartbeat":
+            global LAST_HEARTBEAT
+            LAST_HEARTBEAT = time.monotonic()
+            self._send(200, b"ok", "text/plain")
+            return
         if self.path.startswith("/viz/"):
             data = VIZ_CACHE.get(self.path[len("/viz/"):])
             if data is None:
@@ -396,6 +426,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_preview()
             elif self.path == "/process":
                 self._handle_process()
+            elif self.path == "/shutdown":
+                self._send(200, b"bye", "text/plain")
+                threading.Thread(
+                    target=lambda: (time.sleep(0.2), os._exit(0)),
+                    daemon=True,
+                ).start()
             else:
                 self._send(404, b"not found", "text/plain")
         except Exception as e:
@@ -528,11 +564,25 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def _watchdog():
+    """Exit if the browser hasn't heart-beaten in HEARTBEAT_TIMEOUT_S.
+    Grace period: ignore the first ~15s so a slow browser launch isn't fatal."""
+    grace_until = time.monotonic() + 15.0
+    while True:
+        time.sleep(HEARTBEAT_CHECK_S)
+        now = time.monotonic()
+        if now < grace_until:
+            continue
+        if now - LAST_HEARTBEAT > HEARTBEAT_TIMEOUT_S:
+            os._exit(0)
+
+
 def main():
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Timer(0.4, lambda: webbrowser.open_new_tab(url)).start()
+    threading.Thread(target=_watchdog, daemon=True).start()
     print(f"polytime running at {url}  (Ctrl+C to stop)")
     try:
         srv.serve_forever()
