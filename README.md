@@ -24,7 +24,9 @@ A browser tab opens at `http://127.0.0.1:<port>`. Drop a `.mid` file (or use the
 Grab the right zip from the [Releases](../../releases) page:
 
 - **Windows:** `polytime-windows.zip` → `polytime.exe`. Double-click. First launch SmartScreen will warn "unrecognized app" — click *More info → Run anyway*.
-- **macOS:** `polytime-macos.zip` → `polytime`. Apple Silicon (M1/M2/M3/M4). First launch Gatekeeper will block it; right-click → *Open* → confirm. (Or run `xattr -d com.apple.quarantine polytime` once.)
+- **macOS (Apple Silicon — M1/M2/M3/M4):** `polytime-macos-arm64.zip` → `polytime`.
+- **macOS (Intel):** `polytime-macos-intel.zip` → `polytime`. Not sure which Mac you have? Click the Apple menu → *About This Mac* — "Chip" says Apple M-something (arm64) or "Processor" says Intel.
+- For either Mac: first launch Gatekeeper will block the binary; right-click → *Open* → confirm. (Or run `xattr -d com.apple.quarantine polytime` once in Terminal.)
 - **Linux:** `polytime-linux.zip` → `polytime`. `chmod +x polytime && ./polytime`.
 
 ### Building binaries yourself
