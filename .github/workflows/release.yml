@@ -1,0 +1,105 @@
+# Build polytime binaries for Windows, macOS, and Linux on every version tag.
+#
+# Usage:
+#   git tag v0.1.0
+#   git push --tags
+#
+# 5–10 minutes later a Draft Release appears on GitHub with three assets
+# attached: polytime-windows.zip, polytime-macos.zip, polytime-linux.zip.
+# Edit the release notes and click Publish.
+name: build & release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:  # also lets you run it manually from the Actions tab
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: polytime-windows
+            sep: ";"
+            ext: ".exe"
+          - os: macos-latest      # arm64 — Apple Silicon (M1/M2/M3/M4)
+            asset: polytime-macos-arm64
+            sep: ":"
+            ext: ""
+          - os: macos-13          # x86_64 — Intel Macs
+            asset: polytime-macos-intel
+            sep: ":"
+            ext: ""
+          - os: ubuntu-latest
+            asset: polytime-linux
+            sep: ":"
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          python -m PyInstaller --onefile --noconsole --name polytime \
+            --add-data "model${{ matrix.sep }}model" \
+            --add-data "transforms${{ matrix.sep }}transforms" \
+            --add-data "viz${{ matrix.sep }}viz" \
+            --add-data "score_io${{ matrix.sep }}score_io" \
+            --collect-submodules matplotlib.backends \
+            --hidden-import matplotlib.backends.backend_svg \
+            --hidden-import matplotlib.backends.backend_agg \
+            app.py
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir staging
+          cp "dist/polytime${{ matrix.ext }}" staging/
+          cp README.md staging/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: staging/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # required to create a release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip each platform
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$dir" && zip -r "../${name}.zip" .)
+          done
+          ls -la
+
+      - name: Create draft release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*.zip
