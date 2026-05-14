@@ -25,11 +25,7 @@ jobs:
             sep: ";"
             ext: ".exe"
           - os: macos-latest      # arm64 — Apple Silicon (M1/M2/M3/M4)
-            asset: polytime-macos-arm64
-            sep: ":"
-            ext: ""
-          - os: macos-13          # x86_64 — Intel Macs
-            asset: polytime-macos-intel
+            asset: polytime-macos
             sep: ":"
             ext: ""
           - os: ubuntu-latest

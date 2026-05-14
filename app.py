@@ -24,6 +24,7 @@ if hasattr(sys, "_MEIPASS"):
 
 from polytime import (  # noqa: E402
     polytime, detect_time_signature, detect_bpm, _parse_when, parse_scale,
+    parse_range,
 )
 from model.measure import TimeSignature  # noqa: E402
 
@@ -34,8 +35,11 @@ VIZ_CACHE: dict[str, bytes] = {}
 # HEARTBEAT_TIMEOUT_S without a ping, the server exits — so closing the tab
 # (or the whole browser) doesn't leave a zombie process holding the port.
 LAST_HEARTBEAT = time.monotonic()
-HEARTBEAT_TIMEOUT_S = 20.0
-HEARTBEAT_CHECK_S = 5.0
+# Generous timeout: browsers throttle setInterval in background tabs (Chrome
+# pauses them entirely after a few minutes), so we must not kill the server
+# just because the user looked at another tab.
+HEARTBEAT_TIMEOUT_S = 180.0
+HEARTBEAT_CHECK_S = 10.0
 
 
 INDEX_HTML = """<!doctype html>
@@ -87,8 +91,8 @@ INDEX_HTML = """<!doctype html>
   MIDI keyboard input requires Chrome, Edge, Opera, or Brave (Web MIDI API).
 </div>
 <div class="row">
-  <label>at (entry per voice, comma-sep — or one value = staggered)
-    <input id="at" type="text" value="2b" placeholder="2b   or   2b, 5b, 9b" style="width:240px">
+  <label>at (per-voice entry — comma list, prefix '+' = relative to previous)
+    <input id="at" type="text" value="2b" placeholder="2b   or   2b, 5b, 9b   or   2b, +2b, +1b" style="width:300px">
   </label>
   <label>scales (one per echo voice — fractions, decimals, sqrt(2), 60bpm…)
     <input id="scales" type="text" value="3/2" placeholder="3/2, 1.5, sqrt(2), 60bpm" style="width:320px">
@@ -98,6 +102,14 @@ INDEX_HTML = """<!doctype html>
   </label>
   <label class="inline">
     <input id="combine" type="checkbox" checked> include original in MIDI
+  </label>
+</div>
+<div class="row">
+  <label>theme range (use only part of input — beats or bars)
+    <input id="themeRange" type="text" placeholder="all   or   0..4b   or   8..16" style="width:220px">
+  </label>
+  <label>output range (crop the final MIDI)
+    <input id="outRange" type="text" placeholder="all   or   0..16b" style="width:220px">
   </label>
   <button id="go">Generate</button>
   <button id="dl" class="dl" style="display:none">Download MIDI</button>
@@ -114,24 +126,32 @@ const $=(id)=>document.getElementById(id);
 const drop=$('drop'), file=$('file'), picked=$('picked'),
       go=$('go'), dl=$('dl'), st=$('status'),
       vizB=$('vizBefore'), vizA=$('vizAfter');
-let chosen=null, dlUrl=null, dlName=null;
+let chosen=null, dlUrl=null, dlName=null, jobId=0;
 
 function setStatus(msg, err=false){st.textContent=msg;st.className=err?'err':'';}
 
 async function pickFile(f){
+  // Bump the job id so any in-flight request from a previous file is ignored
+  // when it returns.
+  const mine = ++jobId;
   chosen=f; picked.textContent=f.name;
+  vizB.src='about:blank'; vizB.classList.add('empty');
   vizA.src='about:blank'; vizA.classList.add('empty');
-  dl.style.display='none';
+  dl.style.display='none'; dlUrl=null; dlName=null;
   setStatus('loading preview...');
   const fd=new FormData(); fd.append('mid', f);
   try{
     const r=await fetch('/preview',{method:'POST',body:fd});
     const j=await r.json();
+    if(mine !== jobId) return;   // a newer file was picked — discard
     if(!r.ok) throw new Error(j.error||'preview failed');
     vizB.src='/viz/'+j.viz_token; vizB.classList.remove('empty');
     $('tsig').placeholder='auto — detected '+j.detected_ts;
     setStatus('detected time signature: '+j.detected_ts);
-  }catch(e){setStatus('error: '+e.message, true);}
+  }catch(e){
+    if(mine !== jobId) return;
+    setStatus('error: '+e.message, true);
+  }
 }
 
 // preventDefault on the whole window so the browser never tries to navigate
@@ -152,6 +172,7 @@ drop.addEventListener('drop',e=>{
 
 go.addEventListener('click',async()=>{
   if(!chosen){setStatus('pick a MIDI file first', true);return;}
+  const mine = ++jobId;
   go.disabled=true; dl.style.display='none';
   setStatus('processing...');
   const fd=new FormData();
@@ -160,22 +181,23 @@ go.addEventListener('click',async()=>{
   fd.append('scales', $('scales').value);
   fd.append('tsig', $('tsig').value);
   fd.append('combine', $('combine').checked ? '1' : '0');
+  fd.append('theme_range', $('themeRange').value);
+  fd.append('output_range', $('outRange').value);
   try{
     const r=await fetch('/process',{method:'POST',body:fd});
     const j=await r.json();
+    if(mine !== jobId) return;
     if(!r.ok) throw new Error(j.error||'failed');
     setStatus('time signature: '+j.detected_ts);
-    // Scale the after-iframe height with the number of viz rows so each row
-    // gets enough vertical space even with many echo voices.
-    // Matplotlib renders ~180px per row at 100dpi (figsize 1.8" per row).
-    // Give a touch more headroom for the title/xlabel padding.
     const perRow = 200;
     vizA.style.height = Math.max(320, perRow * (j.n_rows || 1) + 80) + 'px';
     vizA.src='/viz/'+j.viz_token; vizA.classList.remove('empty');
     dlUrl=j.midi_data_url; dlName=j.midi_filename;
     dl.style.display='inline-block';
-  }catch(e){setStatus('error: '+e.message, true);}
-  finally{go.disabled=false;}
+  }catch(e){
+    if(mine === jobId) setStatus('error: '+e.message, true);
+  }
+  finally{ if(mine === jobId) go.disabled=false; }
 });
 dl.addEventListener('click',()=>{
   if(!dlUrl)return;
@@ -185,9 +207,20 @@ dl.addEventListener('click',()=>{
 // Keep-alive: ping every 5s so the server knows we're still here. If the
 // user closes the tab, the pings stop, and the server self-terminates after
 // ~20s. Also send an explicit shutdown beacon on unload as a fast path.
-setInterval(() => fetch('/heartbeat').catch(()=>{}), 5000);
-window.addEventListener('beforeunload', () => {
-  try { navigator.sendBeacon('/shutdown'); } catch (e) {}
+function heartbeat(){ fetch('/heartbeat').catch(()=>{}); }
+setInterval(heartbeat, 10000);
+// Background tabs get their timers throttled (Chrome pauses them after ~5min);
+// fire an immediate heartbeat whenever the tab becomes visible again so the
+// server's watchdog doesn't decide we're gone.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') heartbeat();
+});
+// Distinguish "user closed the tab" (intent to quit) from a navigation:
+// only send shutdown beacon on pagehide with persisted=false (real close).
+window.addEventListener('pagehide', (e) => {
+  if (!e.persisted) {
+    try { navigator.sendBeacon('/shutdown'); } catch (e2) {}
+  }
 });
 $('quit').addEventListener('click', () => {
   if (!confirm('Stop polytime?')) return;
@@ -487,6 +520,8 @@ class Handler(BaseHTTPRequestHandler):
         scales_str = (fields.get("scales") or b"3/2").decode().strip() or "3/2"
         tsig_str = (fields.get("tsig") or b"").decode().strip()
         combine = (fields.get("combine") or b"1").decode().strip() == "1"
+        theme_range_str = (fields.get("theme_range") or b"").decode().strip()
+        output_range_str = (fields.get("output_range") or b"").decode().strip()
 
         base_bpm = 120.0
         scales = tuple(parse_scale(s.strip(), base_bpm)
@@ -524,20 +559,38 @@ class Handler(BaseHTTPRequestHandler):
 
             at_tokens = [a.strip() for a in at_str.split(",") if a.strip()]
             if len(at_tokens) <= 1:
-                at_f = _parse_when(at_str, ts.beats_per_measure)
-                ats = None  # staggered: k*at
+                # Staggered: voice k enters at k*at. `+` prefix is meaningless
+                # here so strip it if present.
+                base = at_tokens[0].lstrip("+") if at_tokens else "2b"
+                at_f = _parse_when(base, ts.beats_per_measure)
+                ats = None
             else:
                 if len(at_tokens) != len(scales):
                     raise ValueError(
                         f"got {len(at_tokens)} entry times but {len(scales)} scales — "
                         f"give one `at` value (staggered) or one per voice"
                     )
-                at_f = _parse_when(at_tokens[0], ts.beats_per_measure)
-                ats = tuple(_parse_when(t, ts.beats_per_measure) for t in at_tokens)
+                # Resolve each token; '+X' = previous voice's resolved at + X.
+                resolved: list[Fraction] = []
+                for tok in at_tokens:
+                    if tok.startswith("+"):
+                        if not resolved:
+                            raise ValueError(
+                                "first 'at' value can't use '+' — there is no previous voice"
+                            )
+                        resolved.append(resolved[-1]
+                                        + _parse_when(tok[1:], ts.beats_per_measure))
+                    else:
+                        resolved.append(_parse_when(tok, ts.beats_per_measure))
+                at_f = resolved[0]
+                ats = tuple(resolved)
+            theme_range = parse_range(theme_range_str, ts.beats_per_measure)
+            output_range = parse_range(output_range_str, ts.beats_per_measure)
             mid_path, viz_path = polytime(
                 in_path, at=at_f, scales=scales, ats=ats,
                 out=out_mid, diff_png=out_viz, time_signature=ts,
                 combine=combine, viz_connectors=False,
+                theme_range=theme_range, output_range=output_range,
             )
             mid_data = mid_path.read_bytes()
             viz_data = viz_path.read_bytes()

@@ -98,6 +98,23 @@ def detect_time_signature(path: str | Path) -> TimeSignature | None:
     return None
 
 
+def parse_range(s: str, beats_per_bar: Fraction) -> tuple[Fraction, Fraction] | None:
+    """Parse a 'start..end' range; each side accepts the same suffixes as
+    _parse_when ('b' bars, 's' seconds, plain = beats). Empty/None → None.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s or ".." not in s:
+        return None
+    a, b = s.split("..", 1)
+    start = _parse_when(a, beats_per_bar) if a.strip() else Fraction(0)
+    end = _parse_when(b, beats_per_bar)
+    if end <= start:
+        raise ValueError(f"range end must exceed start: {s!r}")
+    return start, end
+
+
 def _parse_when(s: str, beats_per_bar: Fraction, bpm: float = 120.0) -> Fraction:
     s = s.strip().lower()
     if s.endswith("b"):
@@ -178,6 +195,8 @@ def polytime(
     ats: tuple[Fraction, ...] | None = None,
     combine: bool = True,
     viz_connectors: bool = True,
+    theme_range: tuple[Fraction, Fraction] | None = None,
+    output_range: tuple[Fraction, Fraction] | None = None,
 ) -> tuple[Path, Path]:
     """Append rhythm-scaled echoes to the first part of `input_path` and
     write a MIDI file. Returns (midi_path, viz_path).
@@ -212,6 +231,17 @@ def polytime(
     # full polyphony of the input.
     score = load_mido(str(input_path), time_signature=time_signature)
     theme = _flatten_score(score)
+    # Optional theme cropping: keep only events whose onset is in [start, end)
+    # and re-base offsets to 0 so the slice becomes the new "beat 0".
+    if theme_range is not None:
+        ts_start, ts_end = theme_range
+        theme = Voice(id="theme", events=tuple(
+            replace(e, offset=e.offset - ts_start)
+            for e in theme.events
+            if ts_start <= e.offset < ts_end
+        ))
+        if not theme.events:
+            raise ValueError(f"theme range {ts_start}..{ts_end} contains no notes")
 
     def _fmt(x: Fraction) -> str:
         # Compact label: keep small fractions exact (3/2, 5/4) but render
@@ -228,9 +258,27 @@ def polytime(
             id=f"echo_{k}_x{_fmt(s)}@{_fmt(a)}", events=shifted.events,
         ))
 
+    def _crop(v: Voice) -> Voice:
+        if output_range is None:
+            return v
+        lo, hi = output_range
+        kept = tuple(
+            replace(e, offset=e.offset - lo)
+            for e in v.events
+            if lo <= e.offset < hi
+        )
+        return Voice(id=v.id, events=kept)
+
+    theme = _crop(theme)
+    echo_voices = [_crop(v) for v in echo_voices]
+    # Drop voices that ended up empty after cropping.
+    echo_voices = [v for v in echo_voices if v.events]
+
     # Each MIDI-bound voice becomes its own Part → its own MIDI track,
     # so DAWs can solo/mute them independently.
-    exported: list[Voice] = ([theme] if combine else []) + echo_voices
+    exported: list[Voice] = ([theme] if combine and theme.events else []) + echo_voices
+    if not exported:
+        raise ValueError("output range eliminated every voice — widen the crop")
     parts = tuple(
         _voice_to_part(v, cap, time_signature, name=v.id) for v in exported
     )
