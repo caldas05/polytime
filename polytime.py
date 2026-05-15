@@ -2,7 +2,7 @@
 
 Reads a MIDI file, takes the first part, appends a rhythm-scaled copy of
 the theme starting at a chosen moment, and writes back tick-accurate MIDI
-plus a visualization.
+
 
 Usage:
     python polytime.py INPUT.mid [--at WHEN] [--scale RATIO] [-o OUT.mid]
@@ -189,18 +189,16 @@ def polytime(
     at: Fraction | str = Fraction(16),
     scale: Fraction | str = Fraction(3, 2),
     out: str | Path | None = None,
-    diff_png: str | Path | None = None,
     time_signature: TimeSignature = TimeSignature(4, 4),
     scales: tuple[Fraction, ...] | None = None,
     ats: tuple[Fraction, ...] | None = None,
     combine: bool = True,
-    viz_connectors: bool = True,
     theme_range: tuple[Fraction, Fraction] | None = None,
     theme_ranges: tuple[tuple[Fraction, Fraction] | None, ...] | None = None,
     output_range: tuple[Fraction, Fraction] | None = None,
-) -> tuple[Path, Path]:
+) -> Path:
     """Append rhythm-scaled echoes to the first part of `input_path` and
-    write a MIDI file. Returns (midi_path, viz_path).
+    write a MIDI file. Returns the MIDI path
 
     `scales`: per-voice rhythm scales (one entry per echo voice).
     `ats`: per-voice entry times. If None, voice k enters at `k*at` (the
@@ -327,31 +325,8 @@ def polytime(
 
     out = Path(out) if out else input_path.with_name(f"{input_path.stem}_polytime.mid")
     save_mido(poly, str(out))
-
-    viz_path = Path(diff_png) if diff_png else out.with_suffix(".svg")
-    title = f"{input_path.stem} echoes scales=[{scales_label}] ats=[{ats_label}]"
-    rows: list[tuple[str, Voice]] = []
-    if combine and theme_for_output.events:
-        rows.append(("theme", theme_for_output))
-    for v in echo_voices:
-        rows.append((v.id, v))
-    ext = viz_path.suffix.lower()
-    if ext == ".html":
-        from viz.interactive import multi_row_html
-        multi_row_html(rows, viz_path, title=title, combined=True)
-    else:
-        # Legacy SVG/PNG path: fall back to the old diff for CLI users.
-        import matplotlib
-        matplotlib.use("Agg")
-        from viz import diff, trace
-        all_echo_events = [e for v in echo_voices for e in v.events]
-        echo_only = Voice(id="echo", events=tuple(
-            sorted(all_echo_events, key=lambda e: e.offset)
-        ))
-        diff(trace(full_theme), echo_only, title=title,
-             connectors=viz_connectors).savefig(viz_path)
-
-    return out, viz_path
+    
+    return out
 
 
 def main():
@@ -363,9 +338,6 @@ def main():
                     help="rhythm scale (3/2 = 1.5× slower, 2 = 2× slower, 2/3 = faster)")
     ap.add_argument("-o", "--out", default=None,
                     help="output MIDI path (default: <input>_polytime.mid)")
-    ap.add_argument("--viz", choices=["svg", "png", "html"], default="svg",
-                    help="visualization format: svg (default, vector), "
-                         "png (raster), html (interactive pan/zoom in browser)")
     ap.add_argument("--time-sig", default=None,
                     help="override the file's time signature (e.g. 3/4); "
                          "default: read from the MIDI file's meta-event, "
@@ -384,18 +356,15 @@ def main():
         source = "from file" if detected else "default (no meta-event found)"
     print(f"time signature: {ts.numerator}/{ts.denominator} ({source})")
 
-    out, viz = polytime(
+    out = polytime(
         args.input,
         at=_parse_when(args.at, ts.beats_per_measure, args.bpm),
         scale=Fraction(args.scale),
         out=args.out,
-        diff_png=Path(args.out).with_suffix(f".{args.viz}") if args.out
-                 else Path(args.input).with_name(
-                     Path(args.input).stem + "_polytime." + args.viz),
         time_signature=ts,
     )
-    print(f"Wrote {out} and {viz}")
-
+    print(f"Wrote {out}")
+    
 
 if __name__ == "__main__":
     main()

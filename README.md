@@ -65,7 +65,7 @@ Grab the right zip from the [Releases](../../releases) page:
 
 - `app.py` — local web server + single-page UI (drag-drop, recorder, viz embedding).
 - `polytime.py` — the transform engine and CLI (`python polytime.py input.mid --at 2b --scale 3/2`).
-- `model/`, `transforms/`, `score_io/`, `viz/` — the score model, transforms, MIDI I/O, and matplotlib-based piano-roll renderer.
+- `model/`, `transforms/`, `score_io/`— the score model, transforms, and MIDI I/O.
 - `tests/` — pytest suite. Run with `pytest tests/ -q`.
 
 ## Tech notes

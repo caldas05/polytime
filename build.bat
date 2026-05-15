@@ -8,11 +8,7 @@ if not exist %PY% set PY=python
 %PY% -m PyInstaller --onefile --noconsole --name polytime ^
   --add-data "model;model" ^
   --add-data "transforms;transforms" ^
-  --add-data "viz;viz" ^
   --add-data "score_io;score_io" ^
-  --collect-submodules matplotlib.backends ^
-  --hidden-import matplotlib.backends.backend_svg ^
-  --hidden-import matplotlib.backends.backend_agg ^
   app.py
 echo.
 echo Done. See dist\polytime.exe

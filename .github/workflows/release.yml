@@ -54,11 +54,7 @@ jobs:
           python -m PyInstaller --onefile --noconsole --name polytime \
             --add-data "model${{ matrix.sep }}model" \
             --add-data "transforms${{ matrix.sep }}transforms" \
-            --add-data "viz${{ matrix.sep }}viz" \
             --add-data "score_io${{ matrix.sep }}score_io" \
-            --collect-submodules matplotlib.backends \
-            --hidden-import matplotlib.backends.backend_svg \
-            --hidden-import matplotlib.backends.backend_agg \
             app.py
 
       - name: Stage artifact

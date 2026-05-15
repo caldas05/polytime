@@ -132,7 +132,7 @@ INDEX_HTML = """<!doctype html>
     <button data-action="zout">−</button>
     <button data-action="zin">+</button>
     <button data-action="fit">fit</button>
-    <span>shift-drag = pan · wheel = zoom · click on original snaps to notes</span>
+    <span>drag = pan · wheel or +/− = zoom · use pick buttons to select source/start</span>
   </div>
 </div>
 <script>
@@ -351,12 +351,12 @@ c.addEventListener('mousedown', (e) => {
   const mx = e.clientX - r.left, my = e.clientY - r.top;
   const beat = clipBeats(xToBeat(mx, r));
   const rowIdx = rowAtY(my, r);
-  if (e.shiftKey && e.button === 0) {
-    drag = { kind: 'shift-pending', startX: mx, startBeat: beat,
-             rowIdx, lastX: mx, moved: false };
-  } else if (e.button === 2) {
+  if (e.button === 2) {
     drag = { kind: 'pan', startX: mx, lastX: mx, moved: false };
   } else {
+    // Default left-click: pan unless a pick mode is active. In source mode
+    // a drag on the original row sets the range; otherwise the click sets
+    // the start/source on mouseup.
     drag = { kind: 'pending', startX: mx, startBeat: beat, rowIdx, moved: false };
   }
 });
@@ -366,12 +366,12 @@ window.addEventListener('mousemove', (e) => {
   const mx = e.clientX - r.left;
   if (!drag.moved && Math.abs(mx - drag.startX) > DRAG_THRESHOLD_PX) {
     drag.moved = true;
-    if (drag.kind === 'shift-pending') drag.kind = 'pan';
-    else if (drag.kind === 'pending') {
+    if (drag.kind === 'pending') {
       if (mode && mode.type === 'source' && drag.rowIdx === 0) {
         drag.kind = 'drag-source';
       } else {
-        drag.kind = 'noop';
+        drag.kind = 'pan';
+        drag.lastX = drag.startX;
       }
     }
   }
@@ -449,6 +449,12 @@ document.querySelectorAll('.prCtrl button[data-action]').forEach(btn => {
   });
 });
 window.addEventListener('resize', () => { draw(); });
+window.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (e.key === '+' || e.key === '=') { zoomAt(1.4, (xMin+xMax)/2); e.preventDefault(); }
+  else if (e.key === '-' || e.key === '_') { zoomAt(1/1.4, (xMin+xMax)/2); e.preventDefault(); }
+});
 
 // ── echo strip state ───────────────────────────────────────────────────
 const echoes = [];  // [{scale, source:[s,e]|null, start, color}]
@@ -559,8 +565,16 @@ function rebuildRows() {
 }
 
 let previewTimer = null;
+function scaleLooksComplete(s) {
+  s = String(s || '').trim();
+  if (!s) return false;
+  // Reject trailing operators / dangling slashes like "3/" while typing.
+  if (/[\/*+\-^.]$/.test(s)) return false;
+  return true;
+}
 function schedulePreview() {
   if (!chosen || !echoes.length) { draw(); return; }
+  if (!echoes.every(e => scaleLooksComplete(e.scale))) { draw(); return; }
   clearTimeout(previewTimer);
   previewTimer = setTimeout(runPreview, 350);
 }
@@ -1065,11 +1079,10 @@ class Handler(BaseHTTPRequestHandler):
                 parse_range(str(e.get("source", "")).strip() or "", cap)
                 for e in echoes_list
             )
-            mid_path, _viz_path = polytime(
+            mid_path = polytime(
                 in_path, at=ats[0], scales=scales, ats=ats,
-                out=out_mid, diff_png=None, time_signature=ts,
-                combine=combine, viz_connectors=False,
-                theme_ranges=theme_ranges,
+                out=out_mid, time_signature=ts,
+                combine=combine, theme_ranges=theme_ranges,
             )
             mid_data = mid_path.read_bytes()
             # Read the produced MIDI back to recover the per-track note streams
