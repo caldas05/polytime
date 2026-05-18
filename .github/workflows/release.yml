@@ -63,6 +63,7 @@ jobs:
           mkdir staging
           cp "dist/polytime${{ matrix.ext }}" staging/
           cp README.md staging/
+          cp frere.mid staging/
 
       - uses: actions/upload-artifact@v4
         with:
