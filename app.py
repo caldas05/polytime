@@ -216,6 +216,10 @@ let xMin = 0, xMax = 16;
 let mode = null;             // {type:'source'|'start', echoIdx}
 let pendingAnchor = null;    // beat anchor for click+click source range
 let drag = null;
+// Hoisted: the prCtrl IIFE below reads combinedOnly before rebuildRows is
+// reached. With `let` declared at rebuildRows the IIFE hit the temporal
+// dead zone and crashed init — breaking every event handler after it.
+let combinedOnly = localStorage.getItem('combinedOnly') === '1';
 let ROW_MIN_H = (() => {
   const saved = parseInt(localStorage.getItem('rowMinH') || '', 10);
   return (saved >= 40 && saved <= 400) ? saved : 120;
@@ -833,7 +837,6 @@ $('addEcho').addEventListener('click', () => {
 // so per-voice crop persists across row insertions/removals — keying by array
 // index meant removing an upstream row would shift state onto its neighbour
 // (e.g. a stale crop silently muting an echo).
-let combinedOnly = localStorage.getItem('combinedOnly') === '1';
 function rebuildRows() {
   rows = [];
   if (combinedOnly) {
