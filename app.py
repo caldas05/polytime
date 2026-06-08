@@ -163,16 +163,6 @@ INDEX_HTML = """<!doctype html>
 <div class="vizpane">
   <h3>piano roll — one row per input (sources only), one row per polytime, plus combined output</h3>
   <canvas id="pr" class="pr empty"></canvas>
-  <div id="analysisPane" style="margin-top:6px;display:none">
-    <div style="display:flex;align-items:center;gap:10px;font-size:12px;color:#bbb;flex-wrap:wrap">
-      <span>dissonance</span>
-      <label><input type="radio" name="dissMode" value="final" checked> final only</label>
-      <label><input type="radio" name="dissMode" value="external"> external only (between voices)</label>
-      <label><input type="radio" name="dissMode" value="split"> split (each pair + final)</label>
-      <span id="pairStats" style="color:#888"></span>
-    </div>
-    <canvas id="dissStrip" height="28" style="width:100%;display:block;margin-top:2px;background:#111;border:1px solid #333"></canvas>
-  </div>
   <div class="prCtrl">
     <button data-action="zout">−</button>
     <button data-action="zin">+</button>
@@ -403,9 +393,6 @@ function draw() {
   }
   ctx.strokeStyle = '#444'; ctx.lineWidth = 1;
   ctx.strokeRect(padL, padT, plotW(r), plotH(r));
-  // Keep the dissonance strip's heatmap + playhead in lockstep with the
-  // roll's zoom/pan/playback frame. Cheap: ~O(width) per redraw.
-  if (lastAnalysis) drawDissStrip();
 }
 function applyRowCrops(notes, pid) {
   // Honor the per-row crop + the combined "global" crop from the player
@@ -927,152 +914,12 @@ async function runPreview() {
       }
     }
     rebuildRows();
-    renderAnalysis(j.analysis);
     dlUrl = j.midi_data_url; dlName = j.midi_filename;
     dl.style.display = 'inline-block';
   } catch (e) {
     if (mine === previewJobId) setStatus('preview error: '+e.message, true);
   }
 }
-// ── Analysis strip ────────────────────────────────────────────────────
-// Renders the per-pair dissonance curve from the AnalysisReport into a 1-D
-// heat strip aligned to the piano roll's time axis. No new deps; canvas2d
-// only. Pair selector lets the composer flip between voice pairs (echo i
-// vs echo j) and an aggregated mean across all pairs.
-let lastAnalysis = null;
-function renderAnalysis(a) {
-  const pane = $('analysisPane');
-  if (!a || !a.pair_intervals || a.pair_intervals.length === 0) {
-    pane.style.display = 'none';
-    lastAnalysis = null;
-    return;
-  }
-  lastAnalysis = a;
-  pane.style.display = 'block';
-  drawDissStrip();
-}
-// Mean of a list of per-tick curves. Mean (not sum) keeps the heat strip
-// comparable between thin and thick moments — same rationale as the per-
-// tick mean inside _pair_intervals on the Python side.
-function meanDissCurves(pairs) {
-  if (!pairs.length) return null;
-  const n = pairs[0].dissonance_curve.length;
-  const out = new Array(n).fill(0);
-  for (const p of pairs) {
-    for (let t = 0; t < n; t++) out[t] += p.dissonance_curve[t] || 0;
-  }
-  for (let t = 0; t < n; t++) out[t] /= pairs.length;
-  return out;
-}
-// Paint one curve into one strip row inside the shared canvas.
-function paintDissRow(ctx2, curve, tpb, y0, rowH, w) {
-  const n = curve.length;
-  const plotL = padL, plotR = w - padR;
-  for (let x = plotL; x < plotR; x++) {
-    const b0 = xMin + (x - plotL) / (plotR - plotL) * (xMax - xMin);
-    const b1 = xMin + (x + 1 - plotL) / (plotR - plotL) * (xMax - xMin);
-    const t0 = Math.max(0, Math.floor(b0 * tpb));
-    const t1 = Math.min(n, Math.max(t0 + 1, Math.ceil(b1 * tpb)));
-    let s = 0, cc = 0;
-    for (let t = t0; t < t1; t++) { s += curve[t]; cc++; }
-    if (!cc) continue;
-    const v = Math.max(0, Math.min(1, s / cc));
-    const r = Math.round(255 * v);
-    const g = Math.round(120 * v * (1 - v) * 2);
-    ctx2.fillStyle = 'rgb(' + r + ',' + g + ',0)';
-    ctx2.fillRect(x, y0, 1, rowH);
-  }
-  ctx2.strokeStyle = '#333';
-  ctx2.strokeRect(plotL + 0.5, y0 + 0.5, (plotR - plotL) - 1, rowH - 1);
-}
-function dissModeValue() {
-  const r = document.querySelector('input[name="dissMode"]:checked');
-  return r ? r.value : 'final';
-}
-// Truncate a label to fit in `maxPx` using ellipsis. Cheap: linear shrink.
-function fitLabel(ctx2, text, maxPx) {
-  if (ctx2.measureText(text).width <= maxPx) return text;
-  let s = text;
-  while (s.length > 1 && ctx2.measureText(s + '…').width > maxPx) {
-    s = s.slice(0, -1);
-  }
-  return s + '…';
-}
-function drawDissStrip() {
-  const a = lastAnalysis; if (!a) return;
-  const strip = $('dissStrip');
-  const mode = dissModeValue();
-  const w = prEl.clientWidth || 800;
-  const dpr = window.devicePixelRatio || 1;
-  // Always compute the 'final' curve — it's either the only row (final
-  // mode) or the bottom row (split mode).
-  const finalCurve = meanDissCurves(a.pair_intervals);
-  const externalPairs = a.pair_intervals.filter(p => p.voice_i !== p.voice_j);
-  const rows = [];
-  if (mode === 'split') {
-    a.pair_intervals.forEach(p => {
-      const lab = (p.voice_i === p.voice_j)
-        ? p.voice_i + ' (chords)'
-        : p.voice_i + ' ↔ ' + p.voice_j;
-      rows.push({ label: lab, curve: p.dissonance_curve });
-    });
-    if (a.pair_intervals.length > 1) {
-      rows.push({ label: 'final', curve: finalCurve });
-    }
-  } else if (mode === 'external') {
-    const c = meanDissCurves(externalPairs);
-    if (c) rows.push({ label: 'external (' + externalPairs.length + ')', curve: c });
-  } else {
-    rows.push({ label: 'final', curve: finalCurve });
-  }
-  if (!rows.length || !rows[0].curve) {
-    $('pairStats').textContent = '(no data)';
-    return;
-  }
-  $('pairStats').textContent = 'ticks/beat=' + a.ticks_per_beat;
-  // Row height: 28 for the single-row 'final' mode (legible), 22 per row
-  // when splitting so the stack stays compact.
-  const rowH = (mode === 'split') ? 22 : 28;
-  const gap = 1;
-  const totalH = rows.length * rowH + (rows.length - 1) * gap;
-  strip.style.width = w + 'px';
-  strip.style.height = totalH + 'px';
-  strip.width = Math.round(w * dpr);
-  strip.height = Math.round(totalH * dpr);
-  const ctx2 = strip.getContext('2d');
-  ctx2.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx2.fillStyle = '#111'; ctx2.fillRect(0, 0, w, totalH);
-  const tpb = a.ticks_per_beat;
-  const plotL = padL, plotR = w - padR;
-  rows.forEach((row, i) => {
-    const y0 = i * (rowH + gap);
-    paintDissRow(ctx2, row.curve, tpb, y0, rowH, w);
-    // Label lives inside the left gutter [0, padL). Right-aligned at
-    // padL-6 so it never crosses into the heatmap; ellipsis-truncated
-    // when needed so wide voice ids don't push past padL.
-    ctx2.fillStyle = '#bbb';
-    ctx2.font = '11px system-ui,sans-serif';
-    ctx2.textBaseline = 'middle';
-    ctx2.textAlign = 'right';
-    const maxW = plotL - 8;
-    ctx2.fillText(fitLabel(ctx2, row.label, maxW), plotL - 6, y0 + rowH / 2);
-    ctx2.textAlign = 'left';
-  });
-  // Playhead — single vertical line spanning every row.
-  if (typeof playheadBeat === 'number' && playheadBeat != null) {
-    const px = plotL + (playheadBeat - xMin) / (xMax - xMin) * (plotR - plotL);
-    if (px >= plotL - 1 && px <= plotR + 1) {
-      ctx2.strokeStyle = '#ffec5c'; ctx2.lineWidth = 2;
-      ctx2.beginPath(); ctx2.moveTo(px, 0); ctx2.lineTo(px, totalH); ctx2.stroke();
-    }
-  }
-}
-// Wire the layout toggle so flipping single/stacked redraws immediately.
-document.addEventListener('change', (e) => {
-  if (e.target && e.target.name === 'dissMode' && lastAnalysis) drawDissStrip();
-});
-window.addEventListener('resize', () => { if (lastAnalysis) drawDissStrip(); });
-
 function buildFormData() {
   const fd = new FormData();
   inputs.forEach((inp, i) => fd.append('mid_'+i, inp.file, inp.name));
@@ -1116,7 +963,7 @@ function removeInput(id) {
   inputs.splice(i, 1);
   renderInputs();
   if (inputs.length === 0) {
-    originalNotes=[]; processedVoices=null; rebuildRows(); renderAnalysis(null);
+    originalNotes=[]; processedVoices=null; rebuildRows();
     prEl.classList.add('empty'); dl.style.display='none';
     setStatus('');
   } else {
@@ -2097,8 +1944,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_preview()
             elif self.path == "/process":
                 self._handle_process()
-            elif self.path == "/analyze":
-                self._handle_analyze()
             elif self.path == "/shutdown":
                 self._send(200, b"bye", "text/plain")
                 threading.Thread(
@@ -2375,15 +2220,6 @@ class Handler(BaseHTTPRequestHandler):
             voices_payload, total_beats, pitch_lo, pitch_hi = _voices_from_midi(
                 mid_path
             )
-            # Analyse while we still have the file on disk. Failures here
-            # should never block the actual render — degrade to no-analysis
-            # rather than 500 the whole request.
-            try:
-                from analysis.report import analyze_midi_file, _asdict_safe
-                analysis_payload = _asdict_safe(analyze_midi_file(str(mid_path)))
-            except Exception:
-                traceback.print_exc()
-                analysis_payload = None
         finally:
             for it in items:
                 try: it["path"].unlink()
@@ -2402,28 +2238,8 @@ class Handler(BaseHTTPRequestHandler):
                              base64.b64encode(mid_data).decode("ascii"),
             "midi_filename": f"{stem}_polytime.mid",
             "detected_ts": ts_label,
-            "analysis": analysis_payload,
         }
         self._send(200, json.dumps(payload).encode("utf-8"),
-                   "application/json; charset=utf-8")
-
-    def _handle_analyze(self):
-        """Run analysis on a MIDI file uploaded as multipart 'mid'. Returns
-        the JSON AnalysisReport. Separate from /process so a client can re-
-        score arbitrary MIDI without going through the full echo pipeline."""
-        fields = self._read_fields()
-        mid_bytes = fields.get("mid")
-        if not mid_bytes:
-            raise ValueError("missing 'mid' field")
-        tmp = Path(tempfile.mkstemp(suffix=".mid")[1])
-        try:
-            tmp.write_bytes(mid_bytes)
-            from analysis.report import analyze_midi_file, _asdict_safe
-            report = _asdict_safe(analyze_midi_file(str(tmp)))
-        finally:
-            try: tmp.unlink()
-            except OSError: pass
-        self._send(200, json.dumps(report).encode("utf-8"),
                    "application/json; charset=utf-8")
 
 
