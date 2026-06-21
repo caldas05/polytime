@@ -125,6 +125,39 @@ class TestSubharmonicCover:
         assert Tempo(2, 5) in tempi
         assert Tempo(2, 7) in tempi
 
+    def test_isolated_points_use_independent_harmonics(self):
+        # An isolated point (only one divisor class reaches it) that must be
+        # double-covered gets two *mutually independent* harmonics, never a
+        # subharmonic plus its own harmonic (r/5 ⊆ 2·r/5 would be masked: r/5
+        # never sounds alone). For n=5 and n=7 the cover is {2·r/5, 3·r/5} and
+        # {2·r/7, 3·r/7}; for n=4, r/2 is already in so its partner is 3·r/4
+        # (r/4 would be masked by r/2), not r/4.
+        _, K, tempi = subharmonic_cover(
+            [Fraction(2, 5), Fraction(1, 2), Fraction(7, 10), Fraction(7, 5)],
+            pair_with_base=False,
+        )
+        ratios = {Fraction(t.h, t.a) for t in tempi}
+        assert ratios == {Fraction(1, 2), Fraction(3, 4), Fraction(2, 5),
+                          Fraction(3, 5), Fraction(2, 7), Fraction(3, 7)}
+        # No generated voice is rhythmically masked by another (no pulse train
+        # is a subset of another's — periods pairwise non-dividing).
+        for a in tempi:
+            for b in tempi:
+                if a is not b:
+                    assert (a.period / b.period).denominator != 1, (a, b)
+
+    def test_no_masked_voices_general(self):
+        # General guarantee for inputs free of the on-grid (n==1) degeneracy:
+        # the materialized voices have no subset (masking) relation at all.
+        for times in ([3, 4, 5, 6], [6, 10, 15], [8, 9, 10, 12]):
+            _, _, tempi = subharmonic_cover(
+                [Fraction(n) for n in times], pair_with_base=False)
+            for a in tempi:
+                for b in tempi:
+                    if a is not b:
+                        assert (a.period / b.period).denominator != 1, (
+                            times, a, b)
+
     def test_scale_invariant_bars_vs_beats(self):
         # The bug report: T = {0.4,0.5,0.7,1.4} gave 6 voices, but the same
         # points in bars (×beats_per_bar) gave 4 — because the bar scaling
